@@ -1,13 +1,12 @@
 /**
  * Shopping Preferences MCP Server
- * Vercel Serverless Function
- * File: api/mcp.js
+ * Vercel Serverless Function with SSE support for Claude.ai
  */
 
 const SUPABASE_URL = "https://rdiakmwbvyqrmyewrrzp.supabase.co/rest/v1";
 const SUPABASE_KEY = "sb_publishable_VlHxx4Ec1P3fdojSlkcs4g_hz-pL_yc";
 
-const HEADERS = {
+const SUPABASE_HEADERS = {
   "apikey": SUPABASE_KEY,
   "Authorization": `Bearer ${SUPABASE_KEY}`,
   "Content-Type": "application/json",
@@ -16,7 +15,7 @@ const HEADERS = {
 // ── Supabase helper ───────────────────────────────────────────────────────────
 
 async function query(table, params = "") {
-  const res = await fetch(`${SUPABASE_URL}/${table}?${params}`, { headers: HEADERS });
+  const res = await fetch(`${SUPABASE_URL}/${table}?${params}`, { headers: SUPABASE_HEADERS });
   if (!res.ok) throw new Error(`Supabase error: ${res.status} ${await res.text()}`);
   return res.json();
 }
@@ -127,9 +126,9 @@ async function runTool(name, args) {
   }
 }
 
-// ── MCP message router ────────────────────────────────────────────────────────
+// ── MCP message handler ───────────────────────────────────────────────────────
 
-async function handleMCP(msg) {
+async function handleMessage(msg) {
   const { id, method, params } = msg;
 
   if (method === "initialize") {
@@ -141,6 +140,10 @@ async function handleMCP(msg) {
         capabilities: { tools: {} },
       },
     };
+  }
+
+  if (method === "notifications/initialized") {
+    return null;
   }
 
   if (method === "tools/list") {
@@ -168,10 +171,14 @@ async function handleMCP(msg) {
     }
   }
 
-  return {
-    jsonrpc: "2.0", id,
-    error: { code: -32601, message: `Method not found: ${method}` },
-  };
+  if (id !== undefined) {
+    return {
+      jsonrpc: "2.0", id,
+      error: { code: -32601, message: `Method not found: ${method}` },
+    };
+  }
+
+  return null;
 }
 
 // ── Vercel handler ────────────────────────────────────────────────────────────
@@ -180,22 +187,47 @@ export default async function handler(req, res) {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
 
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
 
-  // Health check
+  // SSE endpoint — Claude.ai connects here to establish the MCP session
   if (req.method === "GET") {
-    return res.status(200).json({ status: "ok", server: "shopping-preferences-mcp" });
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    const host = req.headers.host;
+    const protocol = host.includes("localhost") ? "http" : "https";
+    const postUrl = `${protocol}://${host}/api/mcp`;
+
+    res.write(`event: endpoint\ndata: ${postUrl}\n\n`);
+
+    const keepAlive = setInterval(() => {
+      res.write(`: ping\n\n`);
+    }, 15000);
+
+    req.on("close", () => clearInterval(keepAlive));
+    return;
   }
 
-  // MCP endpoint
+  // POST — handle incoming MCP messages
   if (req.method === "POST") {
     try {
-      const response = await handleMCP(req.body);
-      return res.status(200).json(response);
+      const body = req.body;
+      const messages = Array.isArray(body) ? body : [body];
+      const responses = [];
+
+      for (const msg of messages) {
+        const response = await handleMessage(msg);
+        if (response) responses.push(response);
+      }
+
+      if (responses.length === 0) return res.status(204).end();
+      if (responses.length === 1) return res.status(200).json(responses[0]);
+      return res.status(200).json(responses);
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
